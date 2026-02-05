@@ -1,7 +1,13 @@
 FROM ubuntu:24.04
 LABEL org.opencontainers.image.source=https://github.com/riscv/riscv-unified-db
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    MISE_DATA_DIR="/opt/mise" \
+    MISE_CONFIG_DIR="/opt/mise/config" \
+    MISE_CACHE_DIR="/opt/mise/cache" \
+    MISE_STATE_DIR="/opt/mise/state" \
+    MISE_INSTALL_PATH="/usr/local/bin/mise" \
+    MISE_YES=1
 
 WORKDIR /workspace
 
@@ -40,31 +46,27 @@ RUN apt-get update && \
   && apt-get autoremove -y \
   && rm -rf /var/lib/{apt,dpkg,cache,log}/*
 
-ENV MISE_DATA_DIR="/mise"
-ENV MISE_CONFIG_DIR="/mise"
-ENV MISE_CACHE_DIR="/mise/cache"
-# MISE_STATE_DIR needed to prevent permission errors in CI when mise tries to track configs
-# Without this, mise defaults to ~/.local/state which isn't writable by non-root CI users
-ENV MISE_STATE_DIR="/mise/state"
-ENV MISE_INSTALL_PATH="/usr/local/bin/mise"
-ENV MISE_YES=1
-
 RUN curl https://mise.run | sh
 
-COPY .mise.toml /opt/.mise.toml
-COPY .ruby-version /opt/.ruby-version
+COPY .mise.toml .ruby-version /workspace/
 
-WORKDIR /opt
-RUN mise trust /opt/.mise.toml && \
-    mise settings set trusted_config_paths '~' && \
-    mise install --yes
+# - 'mise install -y': Installs tools defined in .mise.toml
+RUN mise settings set trusted_config_paths '~' && \
+    mise trust /workspace/.mise.toml && \
+    mise install -y && \
+    mise prune -y
 
-RUN chmod -R 777 /mise
+# Set installed versions as global defaults (dynamically, no hardcoded versions!)
+# This creates latest symlinks that we can use in PATH
+RUN for tool in node python ruby; do \
+        version=$(ls /opt/mise/installs/$tool | head -1); \
+        mise use --global ${tool}@${version}; \
+    done && \
+    chmod -R 777 /opt/mise
 
-# Verify tools work after mise installation
-RUN cd /opt && \
-    mise env --shell bash | grep '^export PATH=' > /etc/profile.d/mise-path-temp.sh && \
-    bash -c 'source /etc/profile.d/mise-path-temp.sh && ruby --version && node --version && npm --version && python3 --version'
+# Set PATH using latest symlinks (avoids shim overhead and ARG_MAX limit)
+# mise use --global created /opt/mise/installs/{tool}/latest symlinks for us
+ENV PATH="/workspace/bin/container:/opt/node/node_modules/.bin:/opt/venv/bin:/opt/mise/installs/node/latest/bin:/opt/mise/installs/python/latest/bin:/opt/mise/installs/ruby/latest/bin:$PATH"
 
 # build/install eqntott
 RUN git clone --depth=1 https://github.com/TheProjecter/eqntott.git && \
@@ -95,17 +97,16 @@ RUN git clone https://github.com/jar-ben/mustool.git && \
 
 # Create Python virtual environment and install packages
 COPY requirements.txt /opt/requirements.txt
-RUN bash -l -c 'python3 -m venv /opt/venv && \
-  /opt/venv/bin/pip install --no-cache-dir -r /opt/requirements.txt && \
-  rm /opt/requirements.txt'
+RUN python -m venv /opt/venv && \
+  /opt/venv/bin/pip install -r /opt/requirements.txt && \
+  rm /opt/requirements.txt
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install npm packages globally in the container
 COPY package.json package-lock.json /opt/node/
-RUN bash -l -c 'cd /opt/node && \
-  npm ci --no-audit --no-fund && \
-  chown -R root:root /opt/node/node_modules && \
-  rm /opt/node/package.json /opt/node/package-lock.json'
+RUN cd /opt/node && \
+  npm ci && \
+  rm /opt/node/package.json /opt/node/package-lock.json
 ENV NODE_PATH="/opt/node/node_modules"
 ENV PATH="/opt/node/node_modules/.bin:$PATH"
 ENV IN_UDB_CONTAINER=true
@@ -126,19 +127,7 @@ COPY tools/ruby-gems/udb-gen/lib/gem_versions.rb /opt/tools/ruby-gems/udb-gen/li
 COPY tools/ruby-gems/udb-gen/lib/udb-gen/version.rb /opt/tools/ruby-gems/udb-gen/lib/udb-gen/
 COPY tools/ruby-gems/udb_helpers/udb_helpers.gemspec /opt/tools/ruby-gems/udb_helpers/
 COPY tools/ruby-gems/udb_helpers/lib/udb_helpers/version.rb /opt/tools/ruby-gems/udb_helpers/lib/udb_helpers/
-RUN bash -l -c 'bundle install --gemfile /opt/Gemfile'
-
-# Remove mise binary and unset MISE_* env vars to prevent workspace .mise.toml detection
-# Replace mise wrapper scripts (npm/npx) with direct symlinks to avoid "mise: command not found"
-# Tools remain accessible via the PATH extracted earlier to /etc/profile.d/mise-path.sh
-RUN rm -f /usr/local/bin/mise && \
-    rm -rf /mise/cache /mise/downloads && \
-    echo 'unset MISE_DATA_DIR MISE_CONFIG_DIR MISE_CACHE_DIR MISE_STATE_DIR MISE_INSTALL_PATH MISE_YES' >> /etc/bash.bashrc && \
-    for node_dir in /mise/installs/node/*/bin; do \
-        rm -f "$node_dir/npm" "$node_dir/npx" && \
-        ln -s ../lib/node_modules/npm/bin/npm-cli.js "$node_dir/npm" && \
-        ln -s ../lib/node_modules/npm/bin/npx-cli.js "$node_dir/npx"; \
-    done
+RUN bundle install --gemfile /opt/Gemfile
 
 # the binaries for gems need to be copied in
 RUN mkdir -p /workspace/bin/container
@@ -151,21 +140,4 @@ ENV PATH="/workspace/bin/container:$PATH"
 RUN echo ubuntu ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/ubuntu \
     && chmod 0440 /etc/sudoers.d/ubuntu
 
-# Set complete PATH as ENV for Singularity compatibility (doesn't support ENTRYPOINT)
-# We use mise's 'latest' symlinks for Node and Ruby to avoid hardcoding versions
-# Python uses /opt/venv (with packages) instead of mise Python (without packages)
-ENV PATH="/workspace/bin/container:/opt/node/node_modules/.bin:/opt/venv/bin:/opt/bin:/mise/installs/node/latest/bin:/mise/installs/ruby/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-# Create mise-path.sh with the final PATH for Docker ENTRYPOINT (matches ENV above)
-RUN echo "export PATH='/workspace/bin/container:/opt/node/node_modules/.bin:/opt/venv/bin:/opt/bin:/mise/installs/node/latest/bin:/mise/installs/ruby/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'" > /etc/profile.d/mise-path.sh && \
-    chmod +x /etc/profile.d/mise-path.sh
-
-# Create a wrapper script that sources profile and executes commands
-RUN echo '#!/bin/bash' > /entrypoint.sh && \
-    echo 'source /etc/profile.d/mise-path.sh' >> /entrypoint.sh && \
-    echo 'exec "$@"' >> /entrypoint.sh && \
-    chmod +x /entrypoint.sh
-
-# Set ENTRYPOINT to the wrapper script
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/bin/bash"]
+USER ubuntu
